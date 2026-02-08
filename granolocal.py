@@ -494,12 +494,6 @@ def save_shared_note(url: str, output_dir: str):
     filename = f"{dt.strftime('%Y-%m-%d')} - {safe_title}.md"
 
     filepath = shared_dir / filename
-    counter = 2
-    while filepath.exists():
-        filename = f"{dt.strftime('%Y-%m-%d')} - {safe_title} ({counter}).md"
-        filepath = shared_dir / filename
-        counter += 1
-
     filepath.write_text(md, encoding="utf-8")
     print(f"Saved: {filepath}")
 
@@ -576,14 +570,7 @@ def export(output_dir: str, cache_path: str = CACHE_PATH):
         safe_title = sanitize_filename(title)
         filename = f"{dt.strftime('%Y-%m-%d')} - {safe_title}.md"
 
-        # Handle duplicates (multiple meetings same day, same title)
         filepath = month_dir / filename
-        counter = 2
-        while filepath.exists():
-            filename = f"{dt.strftime('%Y-%m-%d')} - {safe_title} ({counter}).md"
-            filepath = month_dir / filename
-            counter += 1
-
         filepath.write_text(md, encoding="utf-8")
         exported += 1
         if transcript_text:
