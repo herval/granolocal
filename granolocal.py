@@ -6,10 +6,13 @@ Reads the local Granola cache and exports each meeting as a Markdown file
 organized by date: output_dir/YYYY/YYYY-MM/YYYY-MM-DD - Title.md
 """
 
+import gzip
 import json
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
 from datetime import datetime
 from html.parser import HTMLParser
@@ -18,6 +21,11 @@ from pathlib import Path
 CACHE_PATH = os.path.expanduser(
     "~/Library/Application Support/Granola/cache-v3.json"
 )
+AUTH_PATH = os.path.expanduser(
+    "~/Library/Application Support/Granola/supabase.json"
+)
+GRANOLA_API = "https://api.granola.ai"
+WORKOS_AUTH_URL = "https://api.workos.com/user_management/authenticate"
 DEFAULT_OUTPUT_DIR = os.path.join(os.getcwd(), "granola-backup")
 
 
@@ -26,6 +34,93 @@ def load_cache(path: str) -> dict:
         outer = json.load(f)
     cache = json.loads(outer["cache"])
     return cache["state"]
+
+
+def _api_request(endpoint: str, body: dict, access_token: str) -> any:
+    """Make an authenticated POST request to the Granola API."""
+    url = f"{GRANOLA_API}{endpoint}"
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers={
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "granolocal/1.0",
+    })
+    with urllib.request.urlopen(req) as resp:
+        raw = resp.read()
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        return json.loads(raw.decode("utf-8"))
+
+
+def load_auth_tokens() -> dict:
+    """Load WorkOS auth tokens from Granola's local auth file."""
+    with open(AUTH_PATH) as f:
+        data = json.load(f)
+    return json.loads(data["workos_tokens"])
+
+
+def refresh_access_token(tokens: dict) -> dict:
+    """Refresh the WorkOS access token using the refresh token.
+
+    WorkOS uses refresh token rotation — the old refresh token is
+    invalidated and a new one is returned. We save the updated tokens
+    back to disk so the Granola app and future runs stay in sync.
+    """
+    # Extract client_id from the JWT issuer claim
+    import base64
+    jwt_payload = tokens["access_token"].split(".")[1]
+    jwt_payload += "=" * (4 - len(jwt_payload) % 4)
+    claims = json.loads(base64.b64decode(jwt_payload))
+    client_id = claims["iss"].rstrip("/").rsplit("/", 1)[-1]
+
+    body = json.dumps({
+        "client_id": client_id,
+        "grant_type": "refresh_token",
+        "refresh_token": tokens["refresh_token"],
+    }).encode()
+
+    req = urllib.request.Request(WORKOS_AUTH_URL, data=body, headers={
+        "Content-Type": "application/json",
+    })
+    with urllib.request.urlopen(req) as resp:
+        raw = resp.read()
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        result = json.loads(raw.decode("utf-8"))
+
+    new_tokens = {
+        **tokens,
+        "access_token": result["access_token"],
+        "refresh_token": result["refresh_token"],
+        "expires_in": result.get("expires_in", 21599),
+        "obtained_at": int(time.time() * 1000),
+    }
+
+    # Persist so the Granola app picks up the rotated refresh token
+    with open(AUTH_PATH) as f:
+        auth_file = json.load(f)
+    auth_file["workos_tokens"] = json.dumps(new_tokens)
+    with open(AUTH_PATH, "w") as f:
+        json.dump(auth_file, f)
+
+    return new_tokens
+
+
+def ensure_valid_token(tokens: dict) -> dict:
+    """Return tokens with a valid (non-expired) access token, refreshing if needed."""
+    obtained = tokens["obtained_at"] / 1000
+    expires_at = obtained + tokens["expires_in"]
+    # Refresh if less than 5 minutes remaining
+    if time.time() > expires_at - 300:
+        print("Access token expired, refreshing...")
+        tokens = refresh_access_token(tokens)
+        print("Token refreshed successfully.")
+    return tokens
+
+
+def fetch_transcript_from_api(doc_id: str, access_token: str) -> list:
+    """Fetch transcript entries for a document from the Granola API."""
+    return _api_request("/v1/get-document-transcript", {"document_id": doc_id}, access_token)
 
 
 def extract_text_from_prosemirror(node: dict) -> str:
@@ -498,7 +593,7 @@ def save_shared_note(url: str, output_dir: str):
     print(f"Saved: {filepath}")
 
 
-def export(output_dir: str, cache_path: str = CACHE_PATH):
+def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: bool = False):
     print(f"Loading cache from {cache_path} ...")
     state = load_cache(cache_path)
 
@@ -509,11 +604,27 @@ def export(output_dir: str, cache_path: str = CACHE_PATH):
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
+    # Set up API access if fetching transcripts
+    tokens = None
+    if fetch_transcripts:
+        if not os.path.exists(AUTH_PATH):
+            print(f"Error: Auth file not found at {AUTH_PATH}")
+            print("Cannot fetch transcripts without authentication.")
+            sys.exit(1)
+        tokens = load_auth_tokens()
+        tokens = ensure_valid_token(tokens)
+        print("Authenticated. Will fetch missing transcripts from API.")
+
     exported = 0
     skipped = 0
     with_transcript = 0
+    fetched_count = 0
+    fetch_errors = 0
 
-    for doc_id, doc in documents.items():
+    doc_items = list(documents.items())
+    total = len(doc_items)
+
+    for idx, (doc_id, doc) in enumerate(doc_items):
         # Skip deleted documents
         if doc.get("deleted_at"):
             skipped += 1
@@ -547,8 +658,29 @@ def export(output_dir: str, cache_path: str = CACHE_PATH):
                 content = summary_panels[0].get("content", {})
                 summary_text = extract_text_from_prosemirror(content)
 
-        # Build transcript
+        # Build transcript — use cached first, fetch from API if missing
         transcript_entries = transcripts.get(doc_id, [])
+        if not transcript_entries and fetch_transcripts and tokens:
+            try:
+                # Refresh token if needed (check every request)
+                tokens = ensure_valid_token(tokens)
+                transcript_entries = fetch_transcript_from_api(
+                    doc_id, tokens["access_token"]
+                )
+                if transcript_entries:
+                    fetched_count += 1
+                # Rate limit: ~4 req/sec to stay under the 5/sec limit
+                time.sleep(0.25)
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    pass  # No transcript exists for this document
+                else:
+                    fetch_errors += 1
+                    print(f"  API error ({e.code}) for '{title}', skipping transcript")
+            except Exception as e:
+                fetch_errors += 1
+                print(f"  Error fetching transcript for '{title}': {e}")
+
         transcript_text = format_transcript(transcript_entries)
 
         # Skip docs with no meaningful content
@@ -576,7 +708,13 @@ def export(output_dir: str, cache_path: str = CACHE_PATH):
         if transcript_text:
             with_transcript += 1
 
-    print(f"Done! Exported {exported} documents ({with_transcript} with transcripts), skipped {skipped}.")
+        # Progress indicator
+        if fetch_transcripts and (idx + 1) % 50 == 0:
+            print(f"  Progress: {idx + 1}/{total} documents processed...")
+
+    print(f"\nDone! Exported {exported} documents ({with_transcript} with transcripts), skipped {skipped}.")
+    if fetch_transcripts:
+        print(f"Fetched {fetched_count} transcripts from API ({fetch_errors} errors).")
     print(f"Output: {output}")
 
 
@@ -585,13 +723,15 @@ def print_help():
 
 Usage:
   python3 granolocal.py                          Export all local meetings
+  python3 granolocal.py --fetch-transcripts       Export and fetch missing transcripts from API
   python3 granolocal.py --output /some/path      Export to a custom directory
   python3 granolocal.py --url <url> [--url ...]  Download shared note(s)
 
 Options:
-  --url <url>        Granola shared note URL (https://notes.granola.ai/d/...)
-  --output <dir>     Output directory (default: ./granola-backup/)
-  --help, -h         Show this help message
+  --fetch-transcripts  Fetch missing transcripts from Granola API
+  --url <url>          Granola shared note URL (https://notes.granola.ai/d/...)
+  --output <dir>       Output directory (default: ./granola-backup/)
+  --help, -h           Show this help message
 
 Local export saves to:  output_dir/YYYY/YYYY-MM/YYYY-MM-DD - Title.md
 Shared notes save to:   output_dir/shared/YYYY/YYYY-MM/YYYY-MM-DD - Title.md""")
@@ -606,6 +746,7 @@ def main():
 
     output_dir = DEFAULT_OUTPUT_DIR
     urls = []
+    fetch_transcripts = False
 
     i = 0
     while i < len(args):
@@ -615,6 +756,9 @@ def main():
         elif args[i] == "--url" and i + 1 < len(args):
             urls.append(args[i + 1])
             i += 2
+        elif args[i] == "--fetch-transcripts":
+            fetch_transcripts = True
+            i += 1
         else:
             print(f"Unknown argument: {args[i]}")
             print("Run with --help for usage.")
@@ -633,7 +777,7 @@ def main():
             print(f"Error: Granola cache not found at {CACHE_PATH}")
             print("Make sure Granola is installed and has been used at least once.")
             sys.exit(1)
-        export(output_dir)
+        export(output_dir, fetch_transcripts=fetch_transcripts)
 
 
 if __name__ == "__main__":
