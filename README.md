@@ -9,16 +9,16 @@ Extract Granola.ai meeting transcripts + summaries from the local cache into Mar
 python3 granolocal.py
 
 # Export to a custom directory
-python3 granolocal.py /some/path
+python3 granolocal.py --output /some/path
 
 # Download a shared Granola note
-python3 granolocal.py https://notes.granola.ai/d/<id>
+python3 granolocal.py --url https://notes.granola.ai/d/<id>
 
 # Download multiple shared notes
-python3 granolocal.py https://notes.granola.ai/d/<id1> https://notes.granola.ai/d/<id2>
+python3 granolocal.py --url https://notes.granola.ai/d/<id1> --url https://notes.granola.ai/d/<id2>
 
 # Download shared note to a custom directory
-python3 granolocal.py https://notes.granola.ai/d/<id> /some/path
+python3 granolocal.py --url https://notes.granola.ai/d/<id> --output /some/path
 ```
 
 Requires Python 3.9+ (no external dependencies).

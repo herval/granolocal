@@ -307,6 +307,19 @@ def html_to_markdown(html: str) -> str:
     return parser.get_markdown()
 
 
+def _decode_js_string(s: str) -> str:
+    """Decode JavaScript escape sequences without mangling existing UTF-8."""
+    simple = {"\\n": "\n", "\\t": "\t", "\\r": "\r", "\\\\": "\\", '\\"': '"', "\\/": "/"}
+
+    def replace(m):
+        esc = m.group(0)
+        if esc.startswith("\\u"):
+            return chr(int(esc[2:], 16))
+        return simple.get(esc, esc)
+
+    return re.sub(r"\\u[0-9a-fA-F]{4}|\\[ntr\\\"/]", replace, s)
+
+
 def fetch_shared_note(url: str) -> dict:
     """Fetch a shared Granola note from its public URL.
 
@@ -331,7 +344,7 @@ def fetch_shared_note(url: str) -> dict:
     summary_html = None
 
     for payload in payloads:
-        decoded = payload.encode("utf-8").decode("unicode_escape")
+        decoded = _decode_js_string(payload)
 
         # Find the payload with documentPanel
         if "documentPanel" not in decoded:
@@ -359,7 +372,7 @@ def fetch_shared_note(url: str) -> dict:
 
     # Extract the HTML summary content from separate RSC payloads
     for payload in payloads:
-        decoded = payload.encode("utf-8").decode("unicode_escape")
+        decoded = _decode_js_string(payload)
         # The summary HTML is in payloads that start with <h and contain
         # the actual content (not RSC metadata)
         stripped = decoded.strip()
@@ -580,17 +593,14 @@ def print_help():
     print("""granolocal - Export Granola.ai meetings to local Markdown files.
 
 Usage:
-  python3 granolocal.py                        Export all local meetings
-  python3 granolocal.py [output_dir]           Export to a custom directory
-  python3 granolocal.py <url> [url...]         Download shared note(s)
-  python3 granolocal.py <url> [output_dir]     Download shared note to custom dir
-
-Arguments:
-  output_dir   Output directory (default: ./granola-backup/)
-  url          Granola shared note URL (https://notes.granola.ai/d/...)
+  python3 granolocal.py                          Export all local meetings
+  python3 granolocal.py --output /some/path      Export to a custom directory
+  python3 granolocal.py --url <url> [--url ...]  Download shared note(s)
 
 Options:
-  --help, -h   Show this help message
+  --url <url>        Granola shared note URL (https://notes.granola.ai/d/...)
+  --output <dir>     Output directory (default: ./granola-backup/)
+  --help, -h         Show this help message
 
 Local export saves to:  output_dir/YYYY/YYYY-MM/YYYY-MM-DD - Title.md
 Shared notes save to:   output_dir/shared/YYYY/YYYY-MM/YYYY-MM-DD - Title.md""")
@@ -604,13 +614,20 @@ def main():
         sys.exit(0)
 
     output_dir = DEFAULT_OUTPUT_DIR
+    urls = []
 
-    # Check if any argument is a Granola shared URL
-    urls = [a for a in args if a.startswith("https://notes.granola.ai/")]
-    non_urls = [a for a in args if not a.startswith("https://notes.granola.ai/")]
-
-    if non_urls:
-        output_dir = non_urls[0]
+    i = 0
+    while i < len(args):
+        if args[i] in ("--output", "-o") and i + 1 < len(args):
+            output_dir = args[i + 1]
+            i += 2
+        elif args[i] == "--url" and i + 1 < len(args):
+            urls.append(args[i + 1])
+            i += 2
+        else:
+            print(f"Unknown argument: {args[i]}")
+            print("Run with --help for usage.")
+            sys.exit(1)
 
     if urls:
         # Fetch shared notes
