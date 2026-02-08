@@ -566,7 +566,7 @@ def build_shared_markdown(note: dict) -> str:
     return "\n".join(sections)
 
 
-def save_shared_note(url: str, output_dir: str):
+def save_shared_note(url: str, output_dir: str, overwrite: bool = False):
     """Fetch a shared Granola note and save it locally."""
     print(f"Fetching shared note from {url} ...")
     note = fetch_shared_note(url)
@@ -578,8 +578,6 @@ def save_shared_note(url: str, output_dir: str):
     except (ValueError, TypeError):
         dt = datetime.now()
 
-    md = build_shared_markdown(note)
-
     # Save under shared/YYYY/YYYY-MM/
     output = Path(output_dir)
     shared_dir = output / "shared" / dt.strftime("%Y") / dt.strftime("%Y-%m")
@@ -589,11 +587,16 @@ def save_shared_note(url: str, output_dir: str):
     filename = f"{dt.strftime('%Y-%m-%d')} - {safe_title}.md"
 
     filepath = shared_dir / filename
+    if filepath.exists() and not overwrite:
+        print(f"Skipped (already exists): {filepath}")
+        return
+
+    md = build_shared_markdown(note)
     filepath.write_text(md, encoding="utf-8")
     print(f"Saved: {filepath}")
 
 
-def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: bool = False):
+def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: bool = False, overwrite: bool = False):
     print(f"Loading cache from {cache_path} ...")
     state = load_cache(cache_path)
 
@@ -638,6 +641,14 @@ def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: boo
             dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
         except (ValueError, TypeError):
             dt = datetime.now()
+
+        # Check if file already exists before doing expensive work
+        safe_title = sanitize_filename(title)
+        month_dir = output / dt.strftime("%Y") / dt.strftime("%Y-%m")
+        filepath = month_dir / f"{dt.strftime('%Y-%m-%d')} - {safe_title}.md"
+        if filepath.exists() and not overwrite:
+            skipped += 1
+            continue
 
         # Build summary from panels
         summary_text = ""
@@ -693,16 +704,7 @@ def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: boo
         # Build the markdown
         md = build_markdown(doc, summary_text, transcript_text)
 
-        # Create directory: YYYY/YYYY-MM/
-        year_dir = output / dt.strftime("%Y")
-        month_dir = year_dir / dt.strftime("%Y-%m")
         month_dir.mkdir(parents=True, exist_ok=True)
-
-        # Filename: YYYY-MM-DD - Title.md
-        safe_title = sanitize_filename(title)
-        filename = f"{dt.strftime('%Y-%m-%d')} - {safe_title}.md"
-
-        filepath = month_dir / filename
         filepath.write_text(md, encoding="utf-8")
         exported += 1
         if transcript_text:
@@ -731,6 +733,7 @@ Options:
   --fetch-transcripts  Fetch missing transcripts from Granola API
   --url <url>          Granola shared note URL (https://notes.granola.ai/d/...)
   --output <dir>       Output directory (default: ./granola-backup/)
+  --overwrite          Overwrite existing files (default: skip)
   --help, -h           Show this help message
 
 Local export saves to:  output_dir/YYYY/YYYY-MM/YYYY-MM-DD - Title.md
@@ -747,6 +750,7 @@ def main():
     output_dir = DEFAULT_OUTPUT_DIR
     urls = []
     fetch_transcripts = False
+    overwrite = False
 
     i = 0
     while i < len(args):
@@ -759,6 +763,9 @@ def main():
         elif args[i] == "--fetch-transcripts":
             fetch_transcripts = True
             i += 1
+        elif args[i] == "--overwrite":
+            overwrite = True
+            i += 1
         else:
             print(f"Unknown argument: {args[i]}")
             print("Run with --help for usage.")
@@ -768,7 +775,7 @@ def main():
         # Fetch shared notes
         for url in urls:
             try:
-                save_shared_note(url, output_dir)
+                save_shared_note(url, output_dir, overwrite=overwrite)
             except Exception as e:
                 print(f"Error fetching {url}: {e}")
     else:
@@ -777,7 +784,7 @@ def main():
             print(f"Error: Granola cache not found at {CACHE_PATH}")
             print("Make sure Granola is installed and has been used at least once.")
             sys.exit(1)
-        export(output_dir, fetch_transcripts=fetch_transcripts)
+        export(output_dir, fetch_transcripts=fetch_transcripts, overwrite=overwrite)
 
 
 if __name__ == "__main__":
