@@ -10,7 +10,9 @@ import json
 import os
 import re
 import sys
+import urllib.request
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 
 CACHE_PATH = os.path.expanduser(
@@ -220,6 +222,274 @@ def build_markdown(doc: dict, summary_text: str, transcript_text: str) -> str:
     return "\n".join(sections)
 
 
+class _HTMLToMarkdown(HTMLParser):
+    """Simple HTML to Markdown converter for Granola summary content."""
+
+    def __init__(self):
+        super().__init__()
+        self._parts: list[str] = []
+        self._tag_stack: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        self._tag_stack.append(tag)
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            level = int(tag[1])
+            self._parts.append("\n" + "#" * level + " ")
+        elif tag == "li":
+            # Count nesting depth for indentation
+            depth = sum(1 for t in self._tag_stack if t in ("ul", "ol")) - 1
+            self._parts.append("  " * depth + "- ")
+        elif tag == "p":
+            pass
+        elif tag == "br":
+            self._parts.append("\n")
+        elif tag == "a":
+            href = dict(attrs).get("href", "")
+            self._parts.append(f"[")
+            self._tag_stack[-1] = f"a:{href}"
+        elif tag == "strong" or tag == "b":
+            self._parts.append("**")
+        elif tag == "em" or tag == "i":
+            self._parts.append("*")
+        elif tag == "code":
+            self._parts.append("`")
+        elif tag == "blockquote":
+            self._parts.append("> ")
+
+    def handle_endtag(self, tag):
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._parts.append("\n\n")
+        elif tag == "li":
+            self._parts.append("\n")
+        elif tag == "p":
+            self._parts.append("\n\n")
+        elif tag in ("ul", "ol"):
+            self._parts.append("\n")
+        elif tag == "a":
+            # Pop the a:href entry
+            if self._tag_stack and self._tag_stack[-1].startswith("a:"):
+                href = self._tag_stack[-1].split(":", 1)[1]
+                self._tag_stack.pop()
+                self._parts.append(f"]({href})")
+                return
+            self._parts.append("]")
+        elif tag in ("strong", "b"):
+            self._parts.append("**")
+        elif tag in ("em", "i"):
+            self._parts.append("*")
+        elif tag == "code":
+            self._parts.append("`")
+        elif tag == "blockquote":
+            self._parts.append("\n")
+        if self._tag_stack and self._tag_stack[-1].split(":")[0] == tag:
+            self._tag_stack.pop()
+        elif self._tag_stack:
+            # Pop the matching tag (may not be top due to a: entries)
+            for i in range(len(self._tag_stack) - 1, -1, -1):
+                if self._tag_stack[i].split(":")[0] == tag:
+                    self._tag_stack.pop(i)
+                    break
+
+    def handle_data(self, data):
+        self._parts.append(data)
+
+    def get_markdown(self) -> str:
+        text = "".join(self._parts)
+        # Collapse excessive blank lines
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+
+def html_to_markdown(html: str) -> str:
+    """Convert HTML content to Markdown."""
+    parser = _HTMLToMarkdown()
+    parser.feed(html)
+    return parser.get_markdown()
+
+
+def fetch_shared_note(url: str) -> dict:
+    """Fetch a shared Granola note from its public URL.
+
+    Returns a dict with: title, created_at, creator, attendees, summary_html,
+    source_url, and doc_id.
+    """
+    # Extract doc ID from URL
+    match = re.search(r"/d/([0-9a-f-]+)", url)
+    if not match:
+        raise ValueError(f"Could not extract document ID from URL: {url}")
+    doc_id = match.group(1)
+
+    req = urllib.request.Request(url, headers={"User-Agent": "granolocal/1.0"})
+    with urllib.request.urlopen(req) as resp:
+        html = resp.read().decode("utf-8")
+
+    # Extract RSC payload containing documentPanel data
+    pattern = r'self\.__next_f\.push\(\[\d+,"((?:[^"\\]|\\.)*)"\]'
+    payloads = re.findall(pattern, html, re.DOTALL)
+
+    doc_data = None
+    summary_html = None
+
+    for payload in payloads:
+        decoded = payload.encode("utf-8").decode("unicode_escape")
+
+        # Find the payload with documentPanel
+        if "documentPanel" not in decoded:
+            continue
+
+        # Extract the JSON portion - starts after the RSC prefix (e.g. "5:")
+        json_start = decoded.find("[")
+        if json_start == -1:
+            continue
+
+        # The content/original_content fields are references like "$1a",
+        # so we need to get the HTML content separately. First parse the
+        # structure for metadata.
+        try:
+            rsc_data = json.loads(decoded[json_start:])
+        except json.JSONDecodeError:
+            continue
+
+        # Walk the RSC tree to find documentPanel props
+        doc_data = _find_in_rsc(rsc_data, "documentPanel")
+        break
+
+    if not doc_data:
+        raise ValueError("Could not find document data in shared note page")
+
+    # Extract the HTML summary content from separate RSC payloads
+    for payload in payloads:
+        decoded = payload.encode("utf-8").decode("unicode_escape")
+        # The summary HTML is in payloads that start with <h and contain
+        # the actual content (not RSC metadata)
+        stripped = decoded.strip()
+        if stripped.startswith("<") and ("<h" in stripped[:20] or "<ul" in stripped[:20] or "<p" in stripped[:20]):
+            summary_html = stripped
+            break
+
+    # Build result
+    doc_panel = doc_data
+    document = doc_panel.get("document", {})
+    panel = doc_panel.get("panel", {})
+    metadata = doc_panel.get("documentMetadata", {})
+
+    attendees = []
+    for att in metadata.get("attendees", []):
+        details = att.get("details", {})
+        person = details.get("person", {})
+        name_info = person.get("name", {})
+        name = name_info.get("fullName") or att.get("email", "")
+        if name:
+            attendees.append(name)
+
+    creator = metadata.get("creator", {})
+    creator_details = creator.get("details", {})
+    creator_person = creator_details.get("person", {})
+    creator_name = creator_person.get("name", {}).get("fullName") or creator.get("name") or creator.get("email", "")
+
+    return {
+        "doc_id": doc_id,
+        "title": document.get("title") or metadata.get("title") or "Untitled",
+        "created_at": document.get("created_at") or metadata.get("created_at", ""),
+        "creator": creator_name,
+        "attendees": attendees,
+        "summary_html": summary_html or "",
+        "source_url": url,
+    }
+
+
+def _find_in_rsc(obj, key: str):
+    """Recursively search an RSC data structure for a dict containing the given key."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj
+        for v in obj.values():
+            result = _find_in_rsc(v, key)
+            if result:
+                return result
+    elif isinstance(obj, list):
+        for item in obj:
+            result = _find_in_rsc(item, key)
+            if result:
+                return result
+    return None
+
+
+def build_shared_markdown(note: dict) -> str:
+    """Build markdown content for a shared Granola note."""
+    title = note["title"]
+    created = note["created_at"]
+    creator = note["creator"]
+    attendees = note["attendees"]
+    summary_html = note["summary_html"]
+    source_url = note["source_url"]
+
+    sections = []
+
+    # Header
+    sections.append(f"# {title}\n")
+
+    # Metadata
+    meta_lines = []
+    if created:
+        try:
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            meta_lines.append(f"**Date:** {dt.strftime('%Y-%m-%d %H:%M')}")
+        except (ValueError, TypeError):
+            meta_lines.append(f"**Date:** {created}")
+    if creator:
+        meta_lines.append(f"**Creator:** {creator}")
+    if attendees:
+        meta_lines.append(f"**Attendees:** {', '.join(attendees)}")
+    meta_lines.append(f"**Source:** {source_url}")
+
+    if meta_lines:
+        sections.append("\n".join(meta_lines) + "\n")
+
+    # Summary
+    if summary_html:
+        summary_md = html_to_markdown(summary_html)
+        if summary_md:
+            sections.append("---\n")
+            sections.append("## Summary\n")
+            sections.append(summary_md + "\n")
+
+    return "\n".join(sections)
+
+
+def save_shared_note(url: str, output_dir: str):
+    """Fetch a shared Granola note and save it locally."""
+    print(f"Fetching shared note from {url} ...")
+    note = fetch_shared_note(url)
+
+    # Parse date for directory structure
+    created = note["created_at"]
+    try:
+        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        dt = datetime.now()
+
+    md = build_shared_markdown(note)
+
+    # Save under shared/YYYY/YYYY-MM/
+    output = Path(output_dir)
+    shared_dir = output / "shared" / dt.strftime("%Y") / dt.strftime("%Y-%m")
+    shared_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_title = sanitize_filename(note["title"])
+    filename = f"{dt.strftime('%Y-%m-%d')} - {safe_title}.md"
+
+    filepath = shared_dir / filename
+    counter = 2
+    while filepath.exists():
+        filename = f"{dt.strftime('%Y-%m-%d')} - {safe_title} ({counter}).md"
+        filepath = shared_dir / filename
+        counter += 1
+
+    filepath.write_text(md, encoding="utf-8")
+    print(f"Saved: {filepath}")
+
+
 def export(output_dir: str, cache_path: str = CACHE_PATH):
     print(f"Loading cache from {cache_path} ...")
     state = load_cache(cache_path)
@@ -306,18 +576,56 @@ def export(output_dir: str, cache_path: str = CACHE_PATH):
     print(f"Output: {output}")
 
 
+def print_help():
+    print("""granolocal - Export Granola.ai meetings to local Markdown files.
+
+Usage:
+  python3 granolocal.py                        Export all local meetings
+  python3 granolocal.py [output_dir]           Export to a custom directory
+  python3 granolocal.py <url> [url...]         Download shared note(s)
+  python3 granolocal.py <url> [output_dir]     Download shared note to custom dir
+
+Arguments:
+  output_dir   Output directory (default: ./granola-backup/)
+  url          Granola shared note URL (https://notes.granola.ai/d/...)
+
+Options:
+  --help, -h   Show this help message
+
+Local export saves to:  output_dir/YYYY/YYYY-MM/YYYY-MM-DD - Title.md
+Shared notes save to:   output_dir/shared/YYYY/YYYY-MM/YYYY-MM-DD - Title.md""")
+
+
 def main():
-    if len(sys.argv) > 1:
-        output_dir = sys.argv[1]
+    args = sys.argv[1:]
+
+    if "--help" in args or "-h" in args:
+        print_help()
+        sys.exit(0)
+
+    output_dir = DEFAULT_OUTPUT_DIR
+
+    # Check if any argument is a Granola shared URL
+    urls = [a for a in args if a.startswith("https://notes.granola.ai/")]
+    non_urls = [a for a in args if not a.startswith("https://notes.granola.ai/")]
+
+    if non_urls:
+        output_dir = non_urls[0]
+
+    if urls:
+        # Fetch shared notes
+        for url in urls:
+            try:
+                save_shared_note(url, output_dir)
+            except Exception as e:
+                print(f"Error fetching {url}: {e}")
     else:
-        output_dir = DEFAULT_OUTPUT_DIR
-
-    if not os.path.exists(CACHE_PATH):
-        print(f"Error: Granola cache not found at {CACHE_PATH}")
-        print("Make sure Granola is installed and has been used at least once.")
-        sys.exit(1)
-
-    export(output_dir)
+        # Default: export local cache
+        if not os.path.exists(CACHE_PATH):
+            print(f"Error: Granola cache not found at {CACHE_PATH}")
+            print("Make sure Granola is installed and has been used at least once.")
+            sys.exit(1)
+        export(output_dir)
 
 
 if __name__ == "__main__":
