@@ -326,15 +326,16 @@ def fetch_shared_note(url: str) -> dict:
     Returns a dict with: title, created_at, creator, attendees, summary_html,
     source_url, and doc_id.
     """
-    # Extract doc ID from URL
-    match = re.search(r"/d/([0-9a-f-]+)", url)
-    if not match:
-        raise ValueError(f"Could not extract document ID from URL: {url}")
-    doc_id = match.group(1)
-
     req = urllib.request.Request(url, headers={"User-Agent": "granolocal/1.0"})
     with urllib.request.urlopen(req) as resp:
+        final_url = resp.url
         html = resp.read().decode("utf-8")
+
+    # Extract doc ID from the final URL (after redirects, e.g. /t/... -> /d/...)
+    match = re.search(r"/d/([0-9a-f-]+)", final_url)
+    if not match:
+        raise ValueError(f"Could not extract document ID from URL: {final_url}")
+    doc_id = match.group(1)
 
     # Extract RSC payload containing documentPanel data
     pattern = r'self\.__next_f\.push\(\[\d+,"((?:[^"\\]|\\.)*)"\]'
@@ -516,6 +517,7 @@ def export(output_dir: str, cache_path: str = CACHE_PATH):
 
     exported = 0
     skipped = 0
+    with_transcript = 0
 
     for doc_id, doc in documents.items():
         # Skip deleted documents
@@ -584,8 +586,10 @@ def export(output_dir: str, cache_path: str = CACHE_PATH):
 
         filepath.write_text(md, encoding="utf-8")
         exported += 1
+        if transcript_text:
+            with_transcript += 1
 
-    print(f"Done! Exported {exported} documents, skipped {skipped}.")
+    print(f"Done! Exported {exported} documents ({with_transcript} with transcripts), skipped {skipped}.")
     print(f"Output: {output}")
 
 
