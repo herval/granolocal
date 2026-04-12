@@ -19,7 +19,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 CACHE_PATH = os.path.expanduser(
-    "~/Library/Application Support/Granola/cache-v3.json"
+    "~/Library/Application Support/Granola/cache-v6.json"
 )
 AUTH_PATH = os.path.expanduser(
     "~/Library/Application Support/Granola/supabase.json"
@@ -32,7 +32,9 @@ DEFAULT_OUTPUT_DIR = os.path.join(os.getcwd(), "granola-backup")
 def load_cache(path: str) -> dict:
     with open(path) as f:
         outer = json.load(f)
-    cache = json.loads(outer["cache"])
+    cache = outer["cache"]
+    if isinstance(cache, str):
+        cache = json.loads(cache)
     return cache["state"]
 
 
