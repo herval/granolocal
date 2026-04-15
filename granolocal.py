@@ -120,6 +120,17 @@ def ensure_valid_token(tokens: dict) -> dict:
     return tokens
 
 
+def fetch_documents_from_api(access_token: str, limit: int = 250) -> list:
+    """Fetch recent documents from the Granola API.
+
+    The API returns up to ``limit`` documents sorted newest-first.  There is
+    no cursor or offset support — the server ignores pagination parameters
+    and errors above ~260.  This supplements the local cache which may lag
+    behind or stop being updated after Granola app updates.
+    """
+    return _api_request("/v1/get-documents", {"limit": limit}, access_token)
+
+
 def fetch_transcript_from_api(doc_id: str, access_token: str) -> list:
     """Fetch transcript entries for a document from the Granola API."""
     return _api_request("/v1/get-document-transcript", {"document_id": doc_id}, access_token)
@@ -619,6 +630,20 @@ def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: boo
         tokens = load_auth_tokens()
         tokens = ensure_valid_token(tokens)
         print("Authenticated. Will fetch missing transcripts from API.")
+
+        # Fetch recent documents from the API to supplement the (possibly stale) cache
+        try:
+            api_docs = fetch_documents_from_api(tokens["access_token"])
+            api_new = 0
+            for doc in api_docs:
+                doc_id = doc["id"]
+                if doc_id not in documents:
+                    documents[doc_id] = doc
+                    api_new += 1
+            if api_new:
+                print(f"Discovered {api_new} new document(s) from API.")
+        except Exception as e:
+            print(f"Warning: could not fetch documents from API: {e}")
 
     exported = 0
     skipped = 0
