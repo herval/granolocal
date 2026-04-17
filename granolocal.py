@@ -120,15 +120,28 @@ def ensure_valid_token(tokens: dict) -> dict:
     return tokens
 
 
-def fetch_documents_from_api(access_token: str, limit: int = 250) -> list:
-    """Fetch recent documents from the Granola API.
+def fetch_all_documents_from_api(access_token: str, page_size: int = 500) -> list:
+    """Fetch all documents from the Granola v2 API with offset pagination.
 
-    The API returns up to ``limit`` documents sorted newest-first.  There is
-    no cursor or offset support — the server ignores pagination parameters
-    and errors above ~260.  This supplements the local cache which may lag
-    behind or stop being updated after Granola app updates.
+    Returns a list of document dicts sorted newest-first.  The v2 endpoint
+    supports offset pagination (v1 does not).
     """
-    return _api_request("/v1/get-documents", {"limit": limit}, access_token)
+    all_docs = []
+    offset = 0
+    while True:
+        result = _api_request(
+            "/v2/get-documents",
+            {"limit": page_size, "offset": offset},
+            access_token,
+        )
+        docs = result.get("docs", [])
+        if not docs:
+            break
+        all_docs.extend(docs)
+        if len(docs) < page_size:
+            break
+        offset += page_size
+    return all_docs
 
 
 def fetch_transcript_from_api(doc_id: str, access_token: str) -> list:
@@ -610,13 +623,6 @@ def save_shared_note(url: str, output_dir: str, overwrite: bool = False):
 
 
 def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: bool = False, overwrite: bool = False):
-    print(f"Loading cache from {cache_path} ...")
-    state = load_cache(cache_path)
-
-    documents = state.get("documents", {})
-    transcripts = state.get("transcripts", {})
-    panels = state.get("documentPanels", {})
-
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
@@ -631,19 +637,35 @@ def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: boo
         tokens = ensure_valid_token(tokens)
         print("Authenticated. Will fetch missing transcripts from API.")
 
-        # Fetch recent documents from the API to supplement the (possibly stale) cache
+    # Primary document source: v2 API (has all documents with offset pagination).
+    # Falls back to the local cache when not authenticated.
+    documents = {}
+    transcripts = {}
+    panels = {}
+
+    if tokens:
         try:
-            api_docs = fetch_documents_from_api(tokens["access_token"])
-            api_new = 0
-            for doc in api_docs:
-                doc_id = doc["id"]
-                if doc_id not in documents:
-                    documents[doc_id] = doc
-                    api_new += 1
-            if api_new:
-                print(f"Discovered {api_new} new document(s) from API.")
+            print("Fetching documents from API...")
+            api_docs = fetch_all_documents_from_api(tokens["access_token"])
+            documents = {doc["id"]: doc for doc in api_docs}
+            print(f"Loaded {len(documents)} document(s) from API.")
         except Exception as e:
             print(f"Warning: could not fetch documents from API: {e}")
+
+    # Load local cache for panels/transcripts and any documents not covered by the API
+    if os.path.exists(cache_path):
+        print(f"Loading cache from {cache_path} ...")
+        state = load_cache(cache_path)
+        transcripts = state.get("transcripts", {})
+        panels = state.get("documentPanels", {})
+        # Merge in any cache-only documents (e.g. if API fetch failed or was skipped)
+        for doc_id, doc in state.get("documents", {}).items():
+            if doc_id not in documents:
+                documents[doc_id] = doc
+    elif not documents:
+        print(f"Error: Granola cache not found at {cache_path}")
+        print("Make sure Granola is installed and has been used at least once.")
+        sys.exit(1)
 
     exported = 0
     skipped = 0
@@ -806,11 +828,6 @@ def main():
             except Exception as e:
                 print(f"Error fetching {url}: {e}")
     else:
-        # Default: export local cache
-        if not os.path.exists(CACHE_PATH):
-            print(f"Error: Granola cache not found at {CACHE_PATH}")
-            print("Make sure Granola is installed and has been used at least once.")
-            sys.exit(1)
         export(output_dir, fetch_transcripts=fetch_transcripts, overwrite=overwrite)
 
 
