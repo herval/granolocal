@@ -253,6 +253,15 @@ def fetch_transcript_from_api(doc_id: str, access_token: str) -> list:
     return _api_request("/v1/get-document-transcript", {"document_id": doc_id}, access_token)
 
 
+def fetch_panels_from_api(doc_id: str, access_token: str) -> list:
+    """Fetch document panels (incl. Summary) from the Granola API.
+
+    Newer Granola builds no longer cache documentPanels locally, so the
+    Summary content has to come from the API.
+    """
+    return _api_request("/v1/get-document-panels", {"document_id": doc_id}, access_token)
+
+
 def extract_text_from_prosemirror(node: dict) -> str:
     """Recursively extract markdown-ish text from Prosemirror JSON."""
     if not isinstance(node, dict):
@@ -775,6 +784,7 @@ def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: boo
     exported = 0
     skipped = 0
     with_transcript = 0
+    with_summary = 0
     fetched_count = 0
     fetch_errors = 0
 
@@ -804,24 +814,40 @@ def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: boo
             skipped += 1
             continue
 
-        # Build summary from panels
+        # Build summary from panels — try local cache first, fall back to API.
+        # Newer Granola builds no longer cache documentPanels locally.
         summary_text = ""
+        summary_panels = []
         doc_panels = panels.get(doc_id, {})
         if isinstance(doc_panels, dict):
-            # Get summary panels sorted by creation date (latest first)
-            summary_panels = sorted(
-                (
-                    p
-                    for p in doc_panels.values()
+            summary_panels = [
+                p for p in doc_panels.values()
+                if isinstance(p, dict) and p.get("title") == "Summary"
+            ]
+
+        if not summary_panels and fetch_transcripts and tokens:
+            try:
+                tokens = ensure_valid_token(tokens)
+                api_panels = fetch_panels_from_api(doc_id, tokens["access_token"])
+                summary_panels = [
+                    p for p in (api_panels or [])
                     if isinstance(p, dict) and p.get("title") == "Summary"
-                ),
-                key=lambda p: p.get("created_at", ""),
-                reverse=True,
-            )
-            if summary_panels:
-                # Use the most recent summary
-                content = summary_panels[0].get("content", {})
-                summary_text = extract_text_from_prosemirror(content)
+                    and not p.get("deleted_at")
+                ]
+                time.sleep(0.25)
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    fetch_errors += 1
+                    print(f"  API error ({e.code}) for '{title}', skipping summary")
+            except Exception as e:
+                fetch_errors += 1
+                print(f"  Error fetching summary for '{title}': {e}")
+
+        if summary_panels:
+            # Use the most recent summary
+            summary_panels.sort(key=lambda p: p.get("created_at", ""), reverse=True)
+            content = summary_panels[0].get("content", {})
+            summary_text = extract_text_from_prosemirror(content)
 
         # Build transcript — use cached first, fetch from API if missing
         transcript_entries = transcripts.get(doc_id, [])
@@ -863,12 +889,18 @@ def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: boo
         exported += 1
         if transcript_text:
             with_transcript += 1
+        if summary_text.strip():
+            with_summary += 1
 
         # Progress indicator
         if fetch_transcripts and (idx + 1) % 50 == 0:
             print(f"  Progress: {idx + 1}/{total} documents processed...")
 
-    print(f"\nDone! Exported {exported} documents ({with_transcript} with transcripts), skipped {skipped}.")
+    print(
+        f"\nDone! Exported {exported} documents "
+        f"({with_summary} with summaries, {with_transcript} with transcripts), "
+        f"skipped {skipped}."
+    )
     if fetch_transcripts:
         print(f"Fetched {fetched_count} transcripts from API ({fetch_errors} errors).")
     print(f"Output: {output}")
