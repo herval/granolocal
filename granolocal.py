@@ -6,32 +6,119 @@ Reads the local Granola cache and exports each meeting as a Markdown file
 organized by date: output_dir/YYYY/YYYY-MM/YYYY-MM-DD - Title.md
 """
 
+import base64
 import gzip
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+from hashlib import pbkdf2_hmac
 from html.parser import HTMLParser
 from pathlib import Path
 
-CACHE_PATH = os.path.expanduser(
-    "~/Library/Application Support/Granola/cache-v6.json"
-)
-AUTH_PATH = os.path.expanduser(
-    "~/Library/Application Support/Granola/supabase.json"
-)
+GRANOLA_DIR = os.path.expanduser("~/Library/Application Support/Granola")
+CACHE_PATH = os.path.join(GRANOLA_DIR, "cache-v6.json")
+CACHE_ENC_PATH = os.path.join(GRANOLA_DIR, "cache-v6.json.enc")
+AUTH_PATH = os.path.join(GRANOLA_DIR, "supabase.json")
+AUTH_ENC_PATH = os.path.join(GRANOLA_DIR, "supabase.json.enc")
+DEK_PATH = os.path.join(GRANOLA_DIR, "storage.dek")
+KEYCHAIN_SERVICE = "Granola Safe Storage"
+KEYCHAIN_ACCOUNT = "Granola Key"
 GRANOLA_API = "https://api.granola.ai"
 WORKOS_AUTH_URL = "https://api.workos.com/user_management/authenticate"
 DEFAULT_OUTPUT_DIR = os.path.join(os.getcwd(), "granola-backup")
 
+_cached_dek: bytes | None = None
+
+
+def _load_dek() -> bytes:
+    """Load Granola's data-encryption key.
+
+    Granola stores a 32-byte DEK in storage.dek, itself encrypted with
+    Electron's safeStorage (AES-128-CBC, key derived via PBKDF2-SHA1 from
+    a macOS keychain password, IV = 16 spaces, "v10" prefix).
+    """
+    global _cached_dek
+    if _cached_dek is not None:
+        return _cached_dek
+
+    try:
+        from cryptography.hazmat.primitives import padding
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    except ImportError:
+        raise RuntimeError(
+            "The 'cryptography' package is required to read Granola's "
+            "encrypted cache. Install it with: pip3 install cryptography"
+        )
+
+    pw = subprocess.check_output(
+        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE,
+         "-a", KEYCHAIN_ACCOUNT, "-w"]
+    ).decode().strip().encode()
+
+    key = pbkdf2_hmac("sha1", pw, b"saltysalt", 1003, 16)
+
+    with open(DEK_PATH, "rb") as f:
+        blob = f.read()
+    if not blob.startswith(b"v10"):
+        raise RuntimeError(f"Unexpected storage.dek prefix: {blob[:3]!r}")
+
+    cipher = Cipher(algorithms.AES(key), modes.CBC(b" " * 16))
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(blob[3:]) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    plain = unpadder.update(padded) + unpadder.finalize()
+
+    _cached_dek = base64.b64decode(plain)
+    return _cached_dek
+
+
+def _decrypt_enc_file(path: str) -> bytes:
+    """Decrypt one of Granola's *.enc files (AES-256-GCM)."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    dek = _load_dek()
+    with open(path, "rb") as f:
+        blob = f.read()
+    nonce = blob[:12]
+    ct_and_tag = blob[12:]
+    return AESGCM(dek).decrypt(nonce, ct_and_tag, None)
+
+
+def _encrypt_enc_file(path: str, plaintext: bytes) -> None:
+    """Encrypt and atomically write one of Granola's *.enc files."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    import os as _os
+    dek = _load_dek()
+    nonce = _os.urandom(12)
+    blob = nonce + AESGCM(dek).encrypt(nonce, plaintext, None)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(blob)
+    _os.replace(tmp, path)
+
 
 def load_cache(path: str) -> dict:
-    with open(path) as f:
-        outer = json.load(f)
+    """Load Granola's local cache state.
+
+    Newer Granola versions write an encrypted cache-v6.json.enc alongside
+    (or instead of) the plain cache-v6.json. Prefer whichever exists and
+    is fresher.
+    """
+    enc_path = path + ".enc"
+    plain_mtime = os.path.getmtime(path) if os.path.exists(path) else 0
+    enc_mtime = os.path.getmtime(enc_path) if os.path.exists(enc_path) else 0
+
+    if enc_mtime and enc_mtime >= plain_mtime:
+        outer = json.loads(_decrypt_enc_file(enc_path))
+    else:
+        with open(path) as f:
+            outer = json.load(f)
+
     cache = outer["cache"]
     if isinstance(cache, str):
         cache = json.loads(cache)
@@ -54,10 +141,24 @@ def _api_request(endpoint: str, body: dict, access_token: str) -> any:
         return json.loads(raw.decode("utf-8"))
 
 
+def _read_auth_file() -> tuple[dict, str]:
+    """Read the Granola auth file, preferring the encrypted variant when fresher.
+
+    Returns (parsed_json, source_path) so refresh_access_token can write back
+    to the same file.
+    """
+    plain_mtime = os.path.getmtime(AUTH_PATH) if os.path.exists(AUTH_PATH) else 0
+    enc_mtime = os.path.getmtime(AUTH_ENC_PATH) if os.path.exists(AUTH_ENC_PATH) else 0
+
+    if enc_mtime and enc_mtime >= plain_mtime:
+        return json.loads(_decrypt_enc_file(AUTH_ENC_PATH)), AUTH_ENC_PATH
+    with open(AUTH_PATH) as f:
+        return json.load(f), AUTH_PATH
+
+
 def load_auth_tokens() -> dict:
     """Load WorkOS auth tokens from Granola's local auth file."""
-    with open(AUTH_PATH) as f:
-        data = json.load(f)
+    data, _ = _read_auth_file()
     return json.loads(data["workos_tokens"])
 
 
@@ -69,7 +170,6 @@ def refresh_access_token(tokens: dict) -> dict:
     back to disk so the Granola app and future runs stay in sync.
     """
     # Extract client_id from the JWT issuer claim
-    import base64
     jwt_payload = tokens["access_token"].split(".")[1]
     jwt_payload += "=" * (4 - len(jwt_payload) % 4)
     claims = json.loads(base64.b64decode(jwt_payload))
@@ -98,12 +198,16 @@ def refresh_access_token(tokens: dict) -> dict:
         "obtained_at": int(time.time() * 1000),
     }
 
-    # Persist so the Granola app picks up the rotated refresh token
-    with open(AUTH_PATH) as f:
-        auth_file = json.load(f)
+    # Persist so the Granola app picks up the rotated refresh token.
+    # Re-read fresh in case the Granola app rotated the token concurrently,
+    # and write back to whichever variant (.enc or plain) we read from.
+    auth_file, source = _read_auth_file()
     auth_file["workos_tokens"] = json.dumps(new_tokens)
-    with open(AUTH_PATH, "w") as f:
-        json.dump(auth_file, f)
+    if source == AUTH_ENC_PATH:
+        _encrypt_enc_file(source, json.dumps(auth_file).encode())
+    else:
+        with open(source, "w") as f:
+            json.dump(auth_file, f)
 
     return new_tokens
 
@@ -629,8 +733,8 @@ def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: boo
     # Set up API access if fetching transcripts
     tokens = None
     if fetch_transcripts:
-        if not os.path.exists(AUTH_PATH):
-            print(f"Error: Auth file not found at {AUTH_PATH}")
+        if not (os.path.exists(AUTH_PATH) or os.path.exists(AUTH_ENC_PATH)):
+            print(f"Error: Auth file not found at {AUTH_PATH} or {AUTH_ENC_PATH}")
             print("Cannot fetch transcripts without authentication.")
             sys.exit(1)
         tokens = load_auth_tokens()
@@ -653,7 +757,8 @@ def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: boo
             print(f"Warning: could not fetch documents from API: {e}")
 
     # Load local cache for panels/transcripts and any documents not covered by the API
-    if os.path.exists(cache_path):
+    cache_enc_path = cache_path + ".enc"
+    if os.path.exists(cache_path) or os.path.exists(cache_enc_path):
         print(f"Loading cache from {cache_path} ...")
         state = load_cache(cache_path)
         transcripts = state.get("transcripts", {})
