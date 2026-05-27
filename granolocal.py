@@ -561,9 +561,19 @@ def fetch_shared_note(url: str) -> dict:
     source_url, and doc_id.
     """
     req = urllib.request.Request(url, headers={"User-Agent": "granolocal/1.0"})
-    with urllib.request.urlopen(req) as resp:
+    try:
+        resp = urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        # The shared-note page is server-rendered and currently responds with a
+        # 500 status, but the body still embeds the full note payload. Parse it
+        # anyway instead of treating the error status as fatal.
+        resp = e
+    with resp:
         final_url = resp.url
-        html = resp.read().decode("utf-8")
+        raw = resp.read()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    html = raw.decode("utf-8")
 
     # Extract doc ID from the final URL (after redirects, e.g. /t/... -> /d/...)
     match = re.search(r"/d/([0-9a-f-]+)", final_url)
@@ -615,11 +625,13 @@ def fetch_shared_note(url: str) -> dict:
             summary_html = stripped
             break
 
-    # Build result
-    doc_panel = doc_data
-    document = doc_panel.get("document", {})
-    panel = doc_panel.get("panel", {})
-    metadata = doc_panel.get("documentMetadata", {})
+    # Build result. `_find_in_rsc` returns the wrapper object that holds the
+    # `documentPanel` key, so the document itself is nested one level deeper,
+    # while `documentMetadata` is a sibling of `documentPanel` (and may be null).
+    doc_panel = doc_data.get("documentPanel") or {}
+    document = doc_panel.get("document") or {}
+    panel = doc_panel.get("panel") or {}
+    metadata = doc_data.get("documentMetadata") or {}
 
     attendees = []
     for att in metadata.get("attendees", []):
@@ -633,7 +645,13 @@ def fetch_shared_note(url: str) -> dict:
     creator = metadata.get("creator", {})
     creator_details = creator.get("details", {})
     creator_person = creator_details.get("person", {})
-    creator_name = creator_person.get("name", {}).get("fullName") or creator.get("name") or creator.get("email", "")
+    owner = document.get("owner") or {}
+    creator_name = (
+        creator_person.get("name", {}).get("fullName")
+        or creator.get("name")
+        or creator.get("email")
+        or owner.get("name", "")
+    )
 
     return {
         "doc_id": doc_id,
