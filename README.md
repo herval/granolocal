@@ -21,7 +21,7 @@ python3 granolocal.py --url https://notes.granola.ai/d/<id1> --url https://notes
 python3 granolocal.py --url https://notes.granola.ai/d/<id> --output /some/path
 ```
 
-Requires Python 3.9+ (no external dependencies).
+Requires Python 3.10+ (no external dependencies).
 
 ## Output
 
