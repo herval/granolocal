@@ -8,121 +8,127 @@ organized by date: output_dir/YYYY/YYYY-MM/YYYY-MM-DD - Title.md
 
 import base64
 import gzip
+import hashlib
 import json
 import os
 import re
-import subprocess
+import secrets
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime
-from hashlib import pbkdf2_hmac
 from html.parser import HTMLParser
 from pathlib import Path
 
-GRANOLA_DIR = os.path.expanduser("~/Library/Application Support/Granola")
-CACHE_PATH = os.path.join(GRANOLA_DIR, "cache-v6.json")
-CACHE_ENC_PATH = os.path.join(GRANOLA_DIR, "cache-v6.json.enc")
-AUTH_PATH = os.path.join(GRANOLA_DIR, "supabase.json")
-AUTH_ENC_PATH = os.path.join(GRANOLA_DIR, "supabase.json.enc")
-DEK_PATH = os.path.join(GRANOLA_DIR, "storage.dek")
-KEYCHAIN_SERVICE = "Granola Safe Storage"
-KEYCHAIN_ACCOUNT = "Granola Key"
+# As of the Granola app build dated mid-2026, Granola's local data (cache-v6.json.enc,
+# supabase.json.enc, granola.db) is encrypted with a key held in the macOS data-protection
+# Keychain, unreadable outside Granola's signed app. So instead of decrypting local files,
+# this tool authenticates as its own client (WorkOS PKCE login, `granolocal.py login`) and
+# reads everything from the Granola API. Its token lives in AUTH_FILE, independent of Granola.
 GRANOLA_API = "https://api.granola.ai"
+AUTH_START_URL = f"{GRANOLA_API}/v1/auth"
+AUTH_COMPLETE_URL = f"{GRANOLA_API}/v1/workos-auth-complete"
 WORKOS_AUTH_URL = "https://api.workos.com/user_management/authenticate"
+CLIENT_VERSION = "7.427.9"
+LOGIN_REDIRECT = "https://granola.ai/"
+
+AUTH_DIR = os.path.expanduser("~/.granolocal")
+AUTH_FILE = os.path.join(AUTH_DIR, "auth.json")
 DEFAULT_OUTPUT_DIR = os.path.join(os.getcwd(), "granola-backup")
 
-_cached_dek: bytes | None = None
+
+def _b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 
-def _load_dek() -> bytes:
-    """Load Granola's data-encryption key.
+def _gen_pkce() -> tuple[str, str]:
+    """Return (code_verifier, code_challenge) for an S256 PKCE exchange."""
+    verifier = _b64url(secrets.token_bytes(64))
+    challenge = _b64url(hashlib.sha256(verifier.encode()).digest())
+    return verifier, challenge
 
-    Granola stores a 32-byte DEK in storage.dek, itself encrypted with
-    Electron's safeStorage (AES-128-CBC, key derived via PBKDF2-SHA1 from
-    a macOS keychain password, IV = 16 spaces, "v10" prefix).
+
+def login() -> None:
+    """Interactive WorkOS PKCE login; saves tokens to AUTH_FILE.
+
+    Reproduces the Granola desktop app's login: open an auth URL in the browser,
+    log in, then paste back the final redirect URL. We exchange the returned code
+    (plus our PKCE verifier) for WorkOS tokens via the Granola API.
     """
-    global _cached_dek
-    if _cached_dek is not None:
-        return _cached_dek
+    verifier, challenge = _gen_pkce()
+    click_id = str(uuid.uuid4())
+    params = urllib.parse.urlencode({
+        "dev": "false",
+        "code_challenge": challenge,
+        "platform": "macOS",
+        "version": CLIENT_VERSION,
+        "sign_in_click_id": click_id,
+        "redirect": LOGIN_REDIRECT,
+    })
+    url = f"{AUTH_START_URL}?{params}"
 
+    print("Open this URL in your browser and log in to Granola:\n")
+    print(f"  {url}\n")
+    print("After logging in you'll land on a granola.ai page. Copy the full")
+    print("address-bar URL (it contains ?code=...) and paste it below.\n")
     try:
-        from cryptography.hazmat.primitives import padding
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    except ImportError:
-        raise RuntimeError(
-            "The 'cryptography' package is required to read Granola's "
-            "encrypted cache. Install it with: pip3 install cryptography"
-        )
+        pasted = input("Paste the redirect URL (or just the code): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nLogin cancelled.")
+        sys.exit(1)
+    if not pasted:
+        print("Nothing pasted; aborting.")
+        sys.exit(1)
 
-    pw = subprocess.check_output(
-        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE,
-         "-a", KEYCHAIN_ACCOUNT, "-w"]
-    ).decode().strip().encode()
-
-    key = pbkdf2_hmac("sha1", pw, b"saltysalt", 1003, 16)
-
-    with open(DEK_PATH, "rb") as f:
-        blob = f.read()
-    if not blob.startswith(b"v10"):
-        raise RuntimeError(f"Unexpected storage.dek prefix: {blob[:3]!r}")
-
-    cipher = Cipher(algorithms.AES(key), modes.CBC(b" " * 16))
-    decryptor = cipher.decryptor()
-    padded = decryptor.update(blob[3:]) + decryptor.finalize()
-    unpadder = padding.PKCS7(128).unpadder()
-    plain = unpadder.update(padded) + unpadder.finalize()
-
-    _cached_dek = base64.b64decode(plain)
-    return _cached_dek
-
-
-def _decrypt_enc_file(path: str) -> bytes:
-    """Decrypt one of Granola's *.enc files (AES-256-GCM)."""
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    dek = _load_dek()
-    with open(path, "rb") as f:
-        blob = f.read()
-    nonce = blob[:12]
-    ct_and_tag = blob[12:]
-    return AESGCM(dek).decrypt(nonce, ct_and_tag, None)
-
-
-def _encrypt_enc_file(path: str, plaintext: bytes) -> None:
-    """Encrypt and atomically write one of Granola's *.enc files."""
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    import os as _os
-    dek = _load_dek()
-    nonce = _os.urandom(12)
-    blob = nonce + AESGCM(dek).encrypt(nonce, plaintext, None)
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(blob)
-    _os.replace(tmp, path)
+    code, sicid, platform = _parse_login_redirect(pasted, click_id)
+    body = json.dumps({
+        "code": code,
+        "codeVerifier": verifier,
+        "isDev": False,
+        "platform": platform,
+        "signInClickId": sicid,
+        "sso": False,
+        "ssoCode": "",
+        "inAppCalendarLinking": False,
+        "dubId": "",
+        "ampMarketingId": "",
+        "ampWebAppId": "",
+    }).encode()
+    req = urllib.request.Request(AUTH_COMPLETE_URL, data=body, headers={
+        "Content-Type": "application/json",
+        "User-Agent": f"Granola/{CLIENT_VERSION}",
+        "X-Client-Version": CLIENT_VERSION,
+    })
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        print(f"\nLogin failed (HTTP {e.code}): {e.read()[:200].decode('utf-8', 'replace')}")
+        print("The code is single-use and short-lived — re-run `login` for a fresh URL.")
+        sys.exit(1)
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    result = json.loads(raw.decode("utf-8"))
+    tokens = result.get("tokens", result)
+    save_auth_tokens(tokens)
+    print(f"\nLogged in. Tokens saved to {AUTH_FILE}")
 
 
-def load_cache(path: str) -> dict:
-    """Load Granola's local cache state.
-
-    Newer Granola versions write an encrypted cache-v6.json.enc alongside
-    (or instead of) the plain cache-v6.json. Prefer whichever exists and
-    is fresher.
-    """
-    enc_path = path + ".enc"
-    plain_mtime = os.path.getmtime(path) if os.path.exists(path) else 0
-    enc_mtime = os.path.getmtime(enc_path) if os.path.exists(enc_path) else 0
-
-    if enc_mtime and enc_mtime >= plain_mtime:
-        outer = json.loads(_decrypt_enc_file(enc_path))
-    else:
-        with open(path) as f:
-            outer = json.load(f)
-
-    cache = outer["cache"]
-    if isinstance(cache, str):
-        cache = json.loads(cache)
-    return cache["state"]
+def _parse_login_redirect(pasted: str, default_click_id: str) -> tuple[str, str, str]:
+    """Extract (code, signInClickId, platform) from a pasted redirect URL or bare code."""
+    if "://" in pasted or pasted.startswith("?") or "code=" in pasted:
+        parsed = urllib.parse.urlparse(pasted)
+        q = urllib.parse.parse_qs(parsed.query or parsed.fragment)
+        if "code" not in q:
+            print(f"Could not find a 'code' in: {pasted}")
+            sys.exit(1)
+        return (q["code"][0],
+                q.get("signInClickId", [default_click_id])[0],
+                q.get("platform", ["macos"])[0])
+    return pasted, default_click_id, "macos"
 
 
 def _api_request(endpoint: str, body: dict, access_token: str) -> any:
@@ -141,25 +147,27 @@ def _api_request(endpoint: str, body: dict, access_token: str) -> any:
         return json.loads(raw.decode("utf-8"))
 
 
-def _read_auth_file() -> tuple[dict, str]:
-    """Read the Granola auth file, preferring the encrypted variant when fresher.
-
-    Returns (parsed_json, source_path) so refresh_access_token can write back
-    to the same file.
-    """
-    plain_mtime = os.path.getmtime(AUTH_PATH) if os.path.exists(AUTH_PATH) else 0
-    enc_mtime = os.path.getmtime(AUTH_ENC_PATH) if os.path.exists(AUTH_ENC_PATH) else 0
-
-    if enc_mtime and enc_mtime >= plain_mtime:
-        return json.loads(_decrypt_enc_file(AUTH_ENC_PATH)), AUTH_ENC_PATH
-    with open(AUTH_PATH) as f:
-        return json.load(f), AUTH_PATH
+def save_auth_tokens(tokens: dict) -> None:
+    """Persist WorkOS tokens to AUTH_FILE (chmod 600), stamping obtained_at."""
+    tokens = dict(tokens)
+    tokens.setdefault("obtained_at", int(time.time() * 1000))
+    tokens.setdefault("expires_in", 21599)
+    os.makedirs(AUTH_DIR, exist_ok=True)
+    tmp = AUTH_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(tokens, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, AUTH_FILE)
 
 
 def load_auth_tokens() -> dict:
-    """Load WorkOS auth tokens from Granola's local auth file."""
-    data, _ = _read_auth_file()
-    return json.loads(data["workos_tokens"])
+    """Load this tool's own WorkOS tokens from AUTH_FILE."""
+    if not os.path.exists(AUTH_FILE):
+        print(f"Not logged in ({AUTH_FILE} not found).")
+        print("Run:  python3 granolocal.py login")
+        sys.exit(1)
+    with open(AUTH_FILE) as f:
+        return json.load(f)
 
 
 def refresh_access_token(tokens: dict) -> dict:
@@ -167,7 +175,7 @@ def refresh_access_token(tokens: dict) -> dict:
 
     WorkOS uses refresh token rotation — the old refresh token is
     invalidated and a new one is returned. We save the updated tokens
-    back to disk so the Granola app and future runs stay in sync.
+    back to AUTH_FILE so future runs stay in sync.
     """
     # Extract client_id from the JWT issuer claim
     jwt_payload = tokens["access_token"].split(".")[1]
@@ -197,18 +205,7 @@ def refresh_access_token(tokens: dict) -> dict:
         "expires_in": result.get("expires_in", 21599),
         "obtained_at": int(time.time() * 1000),
     }
-
-    # Persist so the Granola app picks up the rotated refresh token.
-    # Re-read fresh in case the Granola app rotated the token concurrently,
-    # and write back to whichever variant (.enc or plain) we read from.
-    auth_file, source = _read_auth_file()
-    auth_file["workos_tokens"] = json.dumps(new_tokens)
-    if source == AUTH_ENC_PATH:
-        _encrypt_enc_file(source, json.dumps(auth_file).encode())
-    else:
-        with open(source, "w") as f:
-            json.dump(auth_file, f)
-
+    save_auth_tokens(new_tokens)
     return new_tokens
 
 
@@ -753,57 +750,26 @@ def save_shared_note(url: str, output_dir: str, overwrite: bool = False):
     print(f"Saved: {filepath}")
 
 
-def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: bool = False, overwrite: bool = False):
+def export(output_dir: str, overwrite: bool = False):
+    """Export every Granola meeting to Markdown, sourced entirely from the API.
+
+    Granola's local files are encrypted with a key we can't read, so documents,
+    summaries and transcripts all come from the authenticated API. Run
+    `granolocal.py login` first.
+    """
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
-    # Set up API access if fetching transcripts
-    tokens = None
-    if fetch_transcripts:
-        if not (os.path.exists(AUTH_PATH) or os.path.exists(AUTH_ENC_PATH)):
-            print(f"Error: Auth file not found at {AUTH_PATH} or {AUTH_ENC_PATH}")
-            print("Cannot fetch transcripts without authentication.")
-            sys.exit(1)
-        tokens = load_auth_tokens()
-        tokens = ensure_valid_token(tokens)
-        print("Authenticated. Will fetch missing transcripts from API.")
-
-    # Primary document source: v2 API (has all documents with offset pagination).
-    # Falls back to the local cache when not authenticated.
-    documents = {}
-    transcripts = {}
-    panels = {}
-
-    if tokens:
-        try:
-            print("Fetching documents from API...")
-            api_docs = fetch_all_documents_from_api(tokens["access_token"])
-            documents = {doc["id"]: doc for doc in api_docs}
-            print(f"Loaded {len(documents)} document(s) from API.")
-        except Exception as e:
-            print(f"Warning: could not fetch documents from API: {e}")
-
-    # Load local cache for panels/transcripts and any documents not covered by the API
-    cache_enc_path = cache_path + ".enc"
-    if os.path.exists(cache_path) or os.path.exists(cache_enc_path):
-        print(f"Loading cache from {cache_path} ...")
-        state = load_cache(cache_path)
-        transcripts = state.get("transcripts", {})
-        panels = state.get("documentPanels", {})
-        # Merge in any cache-only documents (e.g. if API fetch failed or was skipped)
-        for doc_id, doc in state.get("documents", {}).items():
-            if doc_id not in documents:
-                documents[doc_id] = doc
-    elif not documents:
-        print(f"Error: Granola cache not found at {cache_path}")
-        print("Make sure Granola is installed and has been used at least once.")
-        sys.exit(1)
+    tokens = ensure_valid_token(load_auth_tokens())
+    print("Fetching documents from API...")
+    api_docs = fetch_all_documents_from_api(tokens["access_token"])
+    documents = {doc["id"]: doc for doc in api_docs}
+    print(f"Loaded {len(documents)} document(s) from API.")
 
     exported = 0
     skipped = 0
     with_transcript = 0
     with_summary = 0
-    fetched_count = 0
     fetch_errors = 0
 
     doc_items = list(documents.items())
@@ -832,63 +798,42 @@ def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: boo
             skipped += 1
             continue
 
-        # Build summary from panels — try local cache first, fall back to API.
-        # Newer Granola builds no longer cache documentPanels locally.
+        # Summary — from document panels (API).
         summary_text = ""
-        summary_panels = []
-        doc_panels = panels.get(doc_id, {})
-        if isinstance(doc_panels, dict):
+        try:
+            tokens = ensure_valid_token(tokens)
+            api_panels = fetch_panels_from_api(doc_id, tokens["access_token"])
             summary_panels = [
-                p for p in doc_panels.values()
+                p for p in (api_panels or [])
                 if isinstance(p, dict) and p.get("title") == "Summary"
+                and not p.get("deleted_at")
             ]
-
-        if not summary_panels and fetch_transcripts and tokens:
-            try:
-                tokens = ensure_valid_token(tokens)
-                api_panels = fetch_panels_from_api(doc_id, tokens["access_token"])
-                summary_panels = [
-                    p for p in (api_panels or [])
-                    if isinstance(p, dict) and p.get("title") == "Summary"
-                    and not p.get("deleted_at")
-                ]
-                time.sleep(0.25)
-            except urllib.error.HTTPError as e:
-                if e.code != 404:
-                    fetch_errors += 1
-                    print(f"  API error ({e.code}) for '{title}', skipping summary")
-            except Exception as e:
+            if summary_panels:
+                summary_panels.sort(key=lambda p: p.get("created_at", ""), reverse=True)
+                summary_text = extract_text_from_prosemirror(summary_panels[0].get("content", {}))
+            time.sleep(0.25)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
                 fetch_errors += 1
-                print(f"  Error fetching summary for '{title}': {e}")
+                print(f"  API error ({e.code}) for '{title}', skipping summary")
+        except Exception as e:
+            fetch_errors += 1
+            print(f"  Error fetching summary for '{title}': {e}")
 
-        if summary_panels:
-            # Use the most recent summary
-            summary_panels.sort(key=lambda p: p.get("created_at", ""), reverse=True)
-            content = summary_panels[0].get("content", {})
-            summary_text = extract_text_from_prosemirror(content)
-
-        # Build transcript — use cached first, fetch from API if missing
-        transcript_entries = transcripts.get(doc_id, [])
-        if not transcript_entries and fetch_transcripts and tokens:
-            try:
-                # Refresh token if needed (check every request)
-                tokens = ensure_valid_token(tokens)
-                transcript_entries = fetch_transcript_from_api(
-                    doc_id, tokens["access_token"]
-                )
-                if transcript_entries:
-                    fetched_count += 1
-                # Rate limit: ~4 req/sec to stay under the 5/sec limit
-                time.sleep(0.25)
-            except urllib.error.HTTPError as e:
-                if e.code == 404:
-                    pass  # No transcript exists for this document
-                else:
-                    fetch_errors += 1
-                    print(f"  API error ({e.code}) for '{title}', skipping transcript")
-            except Exception as e:
+        # Transcript (API).
+        transcript_entries = []
+        try:
+            tokens = ensure_valid_token(tokens)
+            transcript_entries = fetch_transcript_from_api(doc_id, tokens["access_token"])
+            # Rate limit: ~4 req/sec to stay under the 5/sec limit
+            time.sleep(0.25)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:  # 404 == no transcript for this document
                 fetch_errors += 1
-                print(f"  Error fetching transcript for '{title}': {e}")
+                print(f"  API error ({e.code}) for '{title}', skipping transcript")
+        except Exception as e:
+            fetch_errors += 1
+            print(f"  Error fetching transcript for '{title}': {e}")
 
         transcript_text = format_transcript(transcript_entries)
 
@@ -911,36 +856,37 @@ def export(output_dir: str, cache_path: str = CACHE_PATH, fetch_transcripts: boo
             with_summary += 1
 
         # Progress indicator
-        if fetch_transcripts and (idx + 1) % 50 == 0:
+        if (idx + 1) % 50 == 0:
             print(f"  Progress: {idx + 1}/{total} documents processed...")
 
     print(
         f"\nDone! Exported {exported} documents "
         f"({with_summary} with summaries, {with_transcript} with transcripts), "
-        f"skipped {skipped}."
+        f"skipped {skipped} ({fetch_errors} fetch errors)."
     )
-    if fetch_transcripts:
-        print(f"Fetched {fetched_count} transcripts from API ({fetch_errors} errors).")
     print(f"Output: {output}")
 
 
 def print_help():
     print("""granolocal - Export Granola.ai meetings to local Markdown files.
 
+Granola's local files are encrypted with a key held in the macOS Keychain and
+unreadable outside the app, so this tool reads everything from the Granola API.
+Authenticate once with `login`; the token is cached in ~/.granolocal/auth.json.
+
 Usage:
-  python3 granolocal.py                          Export all local meetings
-  python3 granolocal.py --fetch-transcripts       Export and fetch missing transcripts from API
-  python3 granolocal.py --output /some/path      Export to a custom directory
-  python3 granolocal.py --url <url> [--url ...]  Download shared note(s)
+  python3 granolocal.py login                     Log in to Granola (one-time)
+  python3 granolocal.py                           Export all meetings (docs + summaries + transcripts)
+  python3 granolocal.py --output /some/path       Export to a custom directory
+  python3 granolocal.py --url <url> [--url ...]   Download shared note(s)
 
 Options:
-  --fetch-transcripts  Fetch missing transcripts from Granola API
   --url <url>          Granola shared note URL (https://notes.granola.ai/d/...)
   --output <dir>       Output directory (default: ./granola-backup/)
   --overwrite          Overwrite existing files (default: skip)
   --help, -h           Show this help message
 
-Local export saves to:  output_dir/YYYY/YYYY-MM/YYYY-MM-DD - Title.md
+Export saves to:        output_dir/YYYY/YYYY-MM/YYYY-MM-DD - Title.md
 Shared notes save to:   output_dir/shared/YYYY/YYYY-MM/YYYY-MM-DD - Title.md""")
 
 
@@ -951,9 +897,12 @@ def main():
         print_help()
         sys.exit(0)
 
+    if args and args[0] == "login":
+        login()
+        return
+
     output_dir = DEFAULT_OUTPUT_DIR
     urls = []
-    fetch_transcripts = False
     overwrite = False
 
     i = 0
@@ -965,7 +914,7 @@ def main():
             urls.append(args[i + 1])
             i += 2
         elif args[i] == "--fetch-transcripts":
-            fetch_transcripts = True
+            # Transcripts are now always fetched; kept as a no-op for compatibility.
             i += 1
         elif args[i] == "--overwrite":
             overwrite = True
@@ -983,7 +932,7 @@ def main():
             except Exception as e:
                 print(f"Error fetching {url}: {e}")
     else:
-        export(output_dir, fetch_transcripts=fetch_transcripts, overwrite=overwrite)
+        export(output_dir, overwrite=overwrite)
 
 
 if __name__ == "__main__":
